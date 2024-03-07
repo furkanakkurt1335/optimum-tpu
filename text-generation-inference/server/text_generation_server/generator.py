@@ -8,7 +8,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch_xla.core.xla_model as xm
 from loguru import logger
-from transformers import AutoTokenizer, PreTrainedTokenizerBase
+from transformers import AutoTokenizer, PreTrainedTokenizerBase, StaticCache
 from transformers.generation import GenerationConfig
 
 from .modeling import TpuModelForCausalLM
@@ -294,6 +294,15 @@ class TpuGenerator(Generator):
         self.special_tokens = self.tokenizer.all_special_ids
         self.slots = [Slot(i, tokenizer, self.model.device) for i in range(self.model.config.batch_size)]
         self.past_key_values = None
+        self.cache_position = None
+        # _setup_cache is specific to some models (e.g.: Gemma and Llama). In those cases it is possible to setup
+        # a static cache, otherwise it is not.
+        self.use_static_cache = True
+        if getattr(self.model, "_setup_cache", False) is False:
+            logger.warning(
+                f"Static cache not available for {self.model.__class__.__name__}. Performance will be affected"
+            )
+            self.use_static_cache = False
 
     @property
     def info(self) -> InfoResponse:
@@ -388,10 +397,16 @@ class TpuGenerator(Generator):
         position_ids = (attention_mask.cumsum(-1) - 1).masked_fill(attention_mask == 0, 0)
         position_ids = position_ids[:, -input_ids.shape[-1] :]
 
-        # Pause previously active slots during generation.
-        # The KV cache of paused slots will be prefilled during generation but new tokens
-        # will be ignored, as they have already been generated and sent back in the last decode.
-        generation, next_batch = self._generate_token(batch.id, input_ids, attention_mask=attention_mask, position_ids=position_ids)
+        if self.use_static_cache:
+            self.model._setup_cache(StaticCache, len(self.slots), self.model.config.sequence_length)
+            self.cache_position = torch.arange(seq_length, device=self.model.device)
+        else:
+            # Reset/clear KV cache
+            self.past_key_values = None
+        generation, next_batch = self._generate_token(
+            batch.id, input_ids, attention_mask=attention_mask, position_ids=position_ids
+        )
+
         # Reactivate previously active slots for the next decode, and append
         # back their next token.
         for slot, next_token in zip(active_slots, next_tokens):
@@ -440,24 +455,35 @@ class TpuGenerator(Generator):
                 position_ids[i, 0] = slot.generated_tokens
         if input_ids is None:
             raise ValueError("Unable to decode tokens for non-prefilled batches (probably due to a previous failure)")
-
+        if self.use_static_cache:
+            self.cache_position = self.cache_position.max(axis=-1)[0].unsqueeze(0)
         return self._generate_token(next_batch_id, input_ids, position_ids=position_ids)
 
     def _generate_token(
-        self, next_batch_id: int, input_ids: torch.LongTensor, **forward_extra_params) -> Tuple[List[Generation], CachedBatch]:
+        self, next_batch_id: int, input_ids: torch.LongTensor, **forward_extra_params
+    ) -> Tuple[List[Generation], CachedBatch]:
         # Forward
-        outputs = self.model(
-            input_ids,
-            past_key_values=self.past_key_values,
-            return_dict=True,
-            use_cache=True,
-            **forward_extra_params,
-        )
-        # Save KV cache
-        self.past_key_values = outputs.past_key_values
+        if self.use_static_cache:
+            # When static cache is available, it is handled within the model. All we need to do is pass the cache_positions
+            outputs = self.model(
+                input_ids,
+                cache_position=self.cache_position,
+                return_dict=True,
+                use_cache=True,
+                **forward_extra_params,
+            )
+        else:
+            outputs = self.model(
+                input_ids,
+                past_key_values=self.past_key_values,
+                return_dict=True,
+                use_cache=True,
+                **forward_extra_params,
+            )
+            # Save KV cache
+            self.past_key_values = outputs.past_key_values
         # Barrier for XLA model
         xm.mark_step(wait=False)
-
         generations = []
         active_slots = False
         for i, slot in enumerate(self.slots):
@@ -505,6 +531,8 @@ class TpuGenerator(Generator):
             batch = self._cached_batch(next_batch_id, request_ids)
         else:
             logger.debug("No more pending requests")
+        # Mark step for XLA model
+        xm.mark_step()
         return generations, batch
 
     def _cached_batch(self, batch_id: int, request_ids: List):
