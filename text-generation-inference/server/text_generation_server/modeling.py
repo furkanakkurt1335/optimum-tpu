@@ -19,7 +19,6 @@ from os import PathLike, environ
 from typing import Any
 
 import torch
-import torch_xla.core.xla_model as xm
 from loguru import logger
 from transformers import AutoModelForCausalLM
 
@@ -41,11 +40,14 @@ class TpuModelForCausalLM(AutoModelForCausalLM):
         if "PJRT_DEVICE" not in environ:
             logger.info("PJRT_DEVICE environment variable not found. Setting it to 'TPU'.")
             environ["PJRT_DEVICE"] = "TPU"
-        device = xm.xla_device()
-        model = AutoModelForCausalLM.from_pretrained(pretrained_model_name_or_path,
-                                                     device_map=device,
-                                                     *model_args,
-                                                     **kwargs)
+        if "DBG_DEVICE" in environ:
+            device = environ["DBG_DEVICE"]
+            logger.debug(f"Device set to: {device}")
+        else:
+            device = "xla"
+        model = AutoModelForCausalLM.from_pretrained(
+            pretrained_model_name_or_path, device_map=device, *model_args, **kwargs
+        )
         # Update config with specific data)
         if task is not None or getattr(model.config, "task", None) is None:
             model.config.task = task
@@ -56,6 +58,7 @@ class TpuModelForCausalLM(AutoModelForCausalLM):
 
         # Do eval, and compile
         model.eval()
-        model = torch.compile(model, backend="openxla_eval")
+        if device == "xla":
+            model = torch.compile(model, backend="openxla_eval")
 
         return model
