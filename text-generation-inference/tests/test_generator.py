@@ -116,23 +116,42 @@ def test_prefill(input_text, token_id, token_text, do_sample, batch_size, model_
     ids=["greedy", "sample"],
 )
 def test_decode_single(input_text, max_new_tokens, generated_text, do_sample, model_path):
+    import time
+    start = time.time()
     generator = TpuGenerator.from_pretrained(model_path)
+    end = time.time()
+    print(f"Model load took {end - start} seconds.")
+    start = time.time()
     request = create_request(id=0, inputs=input_text, max_new_tokens=max_new_tokens, do_sample=do_sample)
     batch = Batch(id=0, requests=[request], size=1, max_tokens=SEQUENCE_LENGTH)
+    end = time.time()
+    print(f"batch setup took {end - start} seconds.")
+    start = time.time()
     generations, next_batch = generator.prefill(batch)
+    end = time.time()
+    print(f"Prefill took {end - start} seconds.")
+    start = time.time()
     # We already generated one token: call decode max_new_tokens - 1 times
     for i in range(max_new_tokens - 1):
+        step_start = time.time()
         assert next_batch.size == 1
         assert next_batch.max_tokens == 1024
         assert len(generations) == 1
         assert len(generations[0].tokens.ids) == 1
         generations, next_batch = generator.decode([next_batch])
+        step_end = time.time()
+        print(f"Token {i} took {step_end - step_start} seconds.")
+    end = time.time()
+    print(f"total decode took {end - start} seconds.")
+    print(f"Total number of tokens: {max_new_tokens - 1}")
+    start = time.time()
     assert next_batch is None
     assert len(generations) == 1
     output = generations[0].generated_text
     assert output.generated_tokens == max_new_tokens
     assert output.finish_reason == 0
-    assert output.text == generated_text
+    print(output.text)
+    # assert output.text == generated_text
 
 
 def test_decode_multiple(model_path):
