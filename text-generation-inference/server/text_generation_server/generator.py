@@ -95,11 +95,12 @@ class Slot:
         PAUSE = 1
         READY = 2
 
-    def __init__(self, id: int, tokenizer: PreTrainedTokenizerBase, device: [str, torch.device]):
+    def __init__(self, id: int, tokenizer: PreTrainedTokenizerBase, device: [str, torch.device], max_length: int):
         self._id = id
         self._tokenizer = tokenizer
         self.clear()
         self._device = device
+        self._max_length = max_length
 
     def clear(self):
         """Clear the slot and mark it as available."""
@@ -180,8 +181,12 @@ class Slot:
         """
         self._tokens = input_ids.clone()
         self._next_text_token_start = 0
-        self._next_text_token_end = torch.numel(self._tokens)
+        self._next_text_token_end = torch.numel(input_ids)
         self._next_text = ""
+
+        self._tokens = torch.zeros(self._max_length, dtype=torch.int64, device=self._device)
+        self._tokens[: self._next_text_token_end] = input_ids
+        self._cur_position = self._next_text_token_end
 
         self._selector = selector
 
@@ -206,7 +211,9 @@ class Slot:
         """Hack to hopefully support generate_stream for the maximum number of tokenizers"""
         # We need to include the tokens that produced the last text to defeat cleanup algorithms in the decode
         # which decide to add a space or not depending on the surrounding ids.
-        new_text = self._tokenizer.decode(self._tokens[self._next_text_token_start :], skip_special_tokens=False)
+        new_text = self._tokenizer.decode(
+            self._tokens[self._next_text_token_start : self._cur_position], skip_special_tokens=False
+        )
         if new_text.endswith("�"):
             # utf-8 char at the end means it's a potential unfinished byte sequence
             # from byte fallback tokenization.
@@ -222,7 +229,12 @@ class Slot:
             return ""
         # Return the decoded text and store its token offsets
         self._next_text_token_start = self._next_text_token_end
-        self._next_text_token_end = torch.numel(self._tokens)
+        self._next_text_token_end = self._cur_position
+
+        # Print next text token start, end and cur_position
+        print(
+            f"next_text_token_start: {self._next_text_token_start} next_text_token_end: {self._next_text_token_end} cur_position: {self._cur_position}"
+        )
         return new_text[len(last_text) :]
 
     def append(self, next_token: int) -> str:
@@ -241,14 +253,18 @@ class Slot:
         Return:
             The corresponding decoded text (if any).
         """
-        self._tokens = torch.cat(
-            [self._tokens, torch.tensor([next_token], device=self._device, dtype=self._tokens.dtype)]
-        )
+        # self._tokens = torch.cat([self._tokens, torch.tensor([0], device=self._device, dtype=self._tokens.dtype)])
+        self._tokens[self._cur_position] = next_token
+        self._cur_position += 1
+        # self._tokens = torch.cat(
+        #     [self._tokens, torch.tensor([next_token], device=self._device, dtype=self._tokens.dtype)]
+        # )
         self._generated_tokens += 1
         next_text = self._decode_next_tokens()
         # Now that a new token has been generated, we can append the previous one to the generated text
         self._generated_text += self._next_text
         self._next_text = next_text
+        print(next_text)
         return next_text
 
     def select(self, input_ids: torch.LongTensor, logits: torch.Tensor) -> torch.LongTensor:
@@ -267,7 +283,7 @@ class Slot:
 
     @property
     def stopped(self) -> bool:
-        return self._selector.stopping_criteria(self._tokens, None)
+        return self._selector.stopping_criteria(self._tokens[: self._cur_position], None)
 
     @property
     def generated_text(self) -> str:
@@ -275,7 +291,7 @@ class Slot:
 
     @property
     def next_token(self) -> int:
-        return None if len(self._tokens) == 0 else self._tokens[-1]
+        return None if self.cur_position == 0 else self._tokens[self._cur_position - 1]
 
     @property
     def max_token(self) -> int:
@@ -296,7 +312,10 @@ class TpuGenerator(Generator):
         tokenizer.padding_side = "left"
         self.tokenizer = tokenizer
         self.special_tokens = self.tokenizer.all_special_ids
-        self.slots = [Slot(i, tokenizer, self.model.device) for i in range(self.model.config.batch_size)]
+        self.slots = [
+            Slot(i, tokenizer, self.model.device, self.model.config.sequence_length)
+            for i in range(self.model.config.batch_size)
+        ]
         self.past_key_values = None
         # _setup_cache is specific to some models (e.g.: Gemma and Llama). In those cases it is possible to setup
         # a static cache, otherwise it is not.
