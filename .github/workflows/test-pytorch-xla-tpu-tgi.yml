@@ -2,13 +2,13 @@ name: Optimum TPU / Test TGI on TPU
 
 on:
   push:
-    branches: [ main ]
-    paths:
-      - "text-generation-inference/**"
-  pull_request:
-    branches: [ main ]
-    paths:
-      - "text-generation-inference/**"
+    branches: [ paulineci ]
+    #paths:
+    #  - "text-generation-inference/**"
+  #pull_request:
+    #branches: [ main ]
+    #paths:
+      #- "text-generation-inference/**"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
@@ -17,20 +17,23 @@ concurrency:
 jobs:
   do-the-job:
     name: Run TGI tests
-    runs-on: optimum-tpu
+    runs-on: tpu-runners-dind
     container:
       # Use an image that works with TPU with Pytorch 2.3.0 (release was not working)
       image: us-central1-docker.pkg.dev/tpu-pytorch-releases/docker/xla@sha256:8f1dcd5b03f993e4da5c20d17c77aff6a5f22d5455f8eb042d2e4b16ac460526
-      options: --shm-size "16gb" --ipc host --privileged
+      options: -e TPU_TOPOLOGY=1x1 -e TPU_WORKER_ID=0 -e TPU_ACCELERATOR_TYPE=v5lite-1 -e TPU_WORKER_HOSTNAMES=localhost -e TPU_SKIP_MDS_QUERY=true --shm-size "16gb" --ipc host --privileged
     env:
       PJRT_DEVICE: TPU
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
+      
+      - name: Install dependencies
+        run: pip install torch~=2.2.0 torch_xla[tpu]~=2.2.0 -f https://storage.googleapis.com/libtpu-releases/index.html
+      
       - name: Checking Pytorch/XLA installation
         run: python -c "import torch_xla.core.xla_model as xm; assert xm.xla_device().type == 'xla', 'XLA device not available'"
 
-      - name: Build and test TGI server
-        run: |
-          HF_TOKEN=${{ secrets.HF_TOKEN_OPTIMUM_TPU_CI }} make tgi_test
+      #- name: Build and test TGI server
+      #  run: |
+      #    HF_TOKEN=${{ secrets.HF_TOKEN_OPTIMUM_TPU_CI }} make tgi_test
