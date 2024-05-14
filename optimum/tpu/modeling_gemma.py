@@ -23,6 +23,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
+import torch_xla.distributed.spmd.xla_sharding as xs
 from torch import nn
 from torch.nn import CrossEntropyLoss
 from transformers.activations import ACT2FN
@@ -171,20 +172,21 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
 
 
 class GemmaMLP(nn.Module):
-    def __init__(self, config, rank=0, world_size=1):
+    def __init__(self, config, rank=0, world_size=1, **spmd_mesh_args):
         super().__init__()
         self.config = config
         self.rank = rank
         self.world_size = world_size
+        self.spmd_mesh_args = spmd_mesh_args
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
-        self.gate_proj = ColumnParallelLinear(
+        self.gate_proj = ColumnParallelLinear.create(
             self.hidden_size, self.intermediate_size, bias=False, rank=self.rank, world_size=self.world_size
         )
-        self.up_proj = ColumnParallelLinear(
+        self.up_proj = ColumnParallelLinear.create(
             self.hidden_size, self.intermediate_size, bias=False, rank=self.rank, world_size=self.world_size
         )
-        self.down_proj = RowParallelLinear(
+        self.down_proj = RowParallelLinear.create(
             self.intermediate_size, self.hidden_size, bias=False, rank=self.rank, world_size=self.world_size
         )
         if config.hidden_activation is None:
@@ -201,6 +203,27 @@ class GemmaMLP(nn.Module):
         self.act_fn = ACT2FN[hidden_activation]
 
     def forward(self, x):
+        if self.spmd_mesh_args:
+            mesh = xs.HybridMesh(**self.spmd_mesh_args)
+            up_proj = self.up_proj(x)
+            # Apply 2D sharding:
+            # up_proj (batch, length, intermediate)
+            # mesh (data, None, model)
+            partition_spec = (("dcn", "data"), None, "model")
+            xs.mark_sharding(up_proj, mesh, partition_spec)
+
+            gate_proj = self.act_fn(self.gate_proj(x))
+            # Apply 2D sharding:
+            # gate_proj (batch, length, intermediate)
+            # mesh (data, None, model)
+            xs.mark_sharding(gate_proj, mesh, partition_spec)
+
+            down_proj = self.down_proj(gate_proj * up_proj)
+            # down_proj (batch, length, hidden)
+            # mesh (data, None, model)
+            xs.mark_sharding(down_proj, mesh, partition_spec)
+            return down_proj
+
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
@@ -227,6 +250,7 @@ class TpuGemmaAttention(nn.Module):
         layer_idx: Optional[int] = None,
         rank: Optional[int] = None,
         world_size: Optional[int] = None,
+        **spmd_mesh_args,
     ):
         super().__init__()
         if rank is None:
@@ -237,6 +261,7 @@ class TpuGemmaAttention(nn.Module):
             self.world_size = get_model_parallel_world_size()
         else:
             self.world_size = world_size
+        self.spmd_mesh_args = spmd_mesh_args
         self.config = config
         self.layer_idx = layer_idx
         if layer_idx is None:
@@ -262,28 +287,28 @@ class TpuGemmaAttention(nn.Module):
                 f" and `num_heads`: {self.num_heads})."
             )
 
-        self.q_proj = ColumnParallelLinear(
+        self.q_proj = ColumnParallelLinear.create(
             self.hidden_size,
             self.num_heads * self.head_dim,
             bias=config.attention_bias,
             world_size=self.world_size,
             rank=self.rank,
         )
-        self.k_proj = ColumnParallelLinear(
+        self.k_proj = ColumnParallelLinear.create(
             self.hidden_size,
             self.num_key_value_heads * self.head_dim,
             bias=config.attention_bias,
             world_size=self.world_size,
             rank=self.rank,
         )
-        self.v_proj = ColumnParallelLinear(
+        self.v_proj = ColumnParallelLinear.create(
             self.hidden_size,
             self.num_key_value_heads * self.head_dim,
             bias=config.attention_bias,
             world_size=self.world_size,
             rank=self.rank,
         )
-        self.o_proj = RowParallelLinear(
+        self.o_proj = RowParallelLinear.create(
             self.num_heads * self.head_dim,
             self.hidden_size,
             bias=config.attention_bias,
@@ -313,6 +338,19 @@ class TpuGemmaAttention(nn.Module):
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
 
+        mesh = None
+        if self.spmd_mesh_args:
+            # Apply 2D sharding:
+            # query_states (batch, length, hidden)
+            # key_states (batch, length, hidden / attention_heads * key_value_heads)
+            # value_states (batch, length, hidden / attention_heads * key_value_heads)
+            # mesh (data, None, model)
+            partition_spec = (("dcn", "data"), None, "model")
+            mesh = xs.HybridMesh(**self.spmd_mesh_args)
+            xs.mark_sharding(query_states, mesh, partition_spec)
+            xs.mark_sharding(key_states, mesh, partition_spec)
+            xs.mark_sharding(value_states, mesh, partition_spec)
+
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
@@ -329,7 +367,13 @@ class TpuGemmaAttention(nn.Module):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        if mesh is None:
+            attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
+        else:
+            # This replaces matmul with einsum, as it seems to improve performance on SPMD.
+            # See https://github.com/pytorch-tpu/transformers/pull/34 for details.
+            attn_weights = torch.einsum("bnsh,bnkh->bnsk", query_states, key_states) / math.sqrt(self.head_dim)
+            xs.mark_sharding(attn_weights, mesh, (("dcn", "data"), "model", None, None))
 
         if attention_mask is not None:  # no matter the length, we just slice it
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
@@ -338,7 +382,12 @@ class TpuGemmaAttention(nn.Module):
         # upcast attention to fp32
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-        attn_output = torch.matmul(attn_weights, value_states)
+        if mesh is None:
+            attn_output = torch.matmul(attn_weights, value_states)
+        else:
+            # attn_weights Batch Num_head Seq Kv_seq
+            # value_states Batch Num_head Seq Head_dim
+            attn_output = torch.einsum("bnsk,bnkh->bnsh", attn_weights, value_states)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
             raise ValueError(
@@ -353,6 +402,12 @@ class TpuGemmaAttention(nn.Module):
 
         if not output_attentions:
             attn_weights = None
+
+        if mesh:
+            # Apply 2D sharding:
+            # attn_output (batch, length, hidden)
+            # mesh (data, None, model)
+            xs.mark_sharding(attn_output, mesh, (("dcn", "data"), None, "model"))
 
         return attn_output, attn_weights, past_key_value
 
@@ -648,17 +703,26 @@ GEMMA_ATTENTION_CLASSES = {
 
 # Copied from transformers.models.llama.modeling_llama.LlamaDecoderLayer with LLAMA->GEMMA,Llama->Gemma
 class TpuGemmaDecoderLayer(nn.Module):
-    def __init__(self, config: GemmaConfig, layer_idx: int, rank: int = 0, world_size: int = 1):
+
+    def __init__(
+        self,
+        config: GemmaConfig,
+        layer_idx: int,
+        rank: int = 0,
+        world_size: int = 1,
+        **spmd_mesh_args,
+    ):
+        super().__init__()
         self.rank = rank
         self.world_size = world_size
-        super().__init__()
+        self.spmd_mesh_args = spmd_mesh_args
         self.hidden_size = config.hidden_size
 
         self.self_attn = GEMMA_ATTENTION_CLASSES[config._attn_implementation](
-            config=config, layer_idx=layer_idx, rank=self.rank, world_size=self.world_size
+            config=config, layer_idx=layer_idx, rank=self.rank, world_size=self.world_size, **self.spmd_mesh_args
         )
 
-        self.mlp = GemmaMLP(config, rank=self.rank, world_size=self.world_size)
+        self.mlp = GemmaMLP(config, rank=self.rank, world_size=self.world_size, **self.spmd_mesh_args)
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -874,7 +938,13 @@ class TpuGemmaModel(GemmaPreTrainedModel):
         config: GemmaConfig
     """
 
-    def __init__(self, config: GemmaConfig, rank: Optional[int] = None, world_size: Optional[int] = None):
+    def __init__(
+        self,
+        config: GemmaConfig,
+        rank: Optional[int] = None,
+        world_size: Optional[int] = None,
+        **spmd_mesh_args,
+    ):
         super().__init__(config)
         if rank is None:
             self.rank = get_model_parallel_rank()
@@ -884,13 +954,14 @@ class TpuGemmaModel(GemmaPreTrainedModel):
             self.world_size = get_model_parallel_world_size()
         else:
             self.world_size = world_size
+        self.spmd_mesh_args = spmd_mesh_args
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
             [
-                TpuGemmaDecoderLayer(config, layer_idx, rank, world_size)
+                TpuGemmaDecoderLayer(config, layer_idx, rank, world_size, **spmd_mesh_args)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
@@ -926,6 +997,9 @@ class TpuGemmaModel(GemmaPreTrainedModel):
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         use_cache = use_cache if use_cache is not None else self.config.use_cache
+        if self.spmd_mesh_args:
+            # HACK: For now disable cache when using SPMD
+            use_cache = False
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -960,6 +1034,11 @@ class TpuGemmaModel(GemmaPreTrainedModel):
 
         # embed positions
         hidden_states = inputs_embeds
+
+        if self.spmd_mesh_args:
+            # Apply 2D sharding
+            mesh = xs.HybridMesh(**self.spmd_mesh_args)
+            xs.mark_sharding(hidden_states, mesh, (("dcn", "data"), None, "model"))
 
         # normalized
         # Gemma downcasts the below to float16, causing sqrt(3072)=55.4256 to become 55.5
@@ -1094,7 +1173,7 @@ class TpuGemmaModel(GemmaPreTrainedModel):
 class TpuGemmaForCausalLM(GemmaPreTrainedModel):
     _tied_weights_keys = ["lm_head.weight"]
 
-    def __init__(self, config, rank=None, world_size=None):
+    def __init__(self, config, rank=None, world_size=None, **spmd_mesh_args):
         super().__init__(config)
         if rank is None:
             self.rank = get_model_parallel_rank()
@@ -1104,9 +1183,11 @@ class TpuGemmaForCausalLM(GemmaPreTrainedModel):
             self.world_size = get_model_parallel_world_size()
         else:
             self.world_size = world_size
-        self.model = TpuGemmaModel(config, rank, world_size)
+        # Store spmd mesh setup
+        self.spmd_mesh_args = spmd_mesh_args
+        self.model = TpuGemmaModel(config, rank, world_size, **spmd_mesh_args)
         self.vocab_size = config.vocab_size
-        self.lm_head = ColumnParallelLinear(
+        self.lm_head = ColumnParallelLinear.create(
             config.hidden_size,
             config.vocab_size,
             bias=False,
@@ -1237,6 +1318,11 @@ class TpuGemmaForCausalLM(GemmaPreTrainedModel):
         hidden_states = outputs[0]
         logits = self.lm_head(hidden_states)
         logits = logits.float()
+
+        if self.spmd_mesh_args:
+            mesh = xs.HybridMesh(**self.spmd_mesh_args)
+            xs.mark_sharding(logits, mesh, (("dcn", "data"), None, "model"))
+
         loss = None
         if labels is not None:
             # Shift so that tokens < n predict n
